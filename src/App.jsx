@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react'
-import { Package, Plus, Search, Trash2, Edit2, X, Archive, TrendingUp, TrendingDown, DollarSign, Calendar, Layers, Activity, MinusCircle, BarChart2, Wrench, Users, ArrowUp, ArrowDown } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import { Package, Plus, Search, Trash2, Edit2, X, Archive, TrendingUp, TrendingDown, DollarSign, Calendar, Layers, Activity, MinusCircle, BarChart2, Wrench, Users, ArrowUp, ArrowDown, Settings } from 'lucide-react'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, LineChart, Line } from 'recharts'
 import './App.css'
 
@@ -29,6 +29,44 @@ function App() {
   const [searchTerm, setSearchTerm] = useState('')
   const [chartTimeframe, setChartTimeframe] = useState('dia') // 'dia', 'mes', 'año'
   
+  // --- Cloud Sync States & Config ---
+  const [syncStatus, setSyncStatus] = useState('local') // 'local', 'loading', 'cloud', 'error'
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false)
+  const [config, setConfig] = useState(() => {
+    const envProjectId = import.meta.env.VITE_FIREBASE_PROJECT_ID
+    const envSecretId = import.meta.env.VITE_INVENTORY_SECRET_ID
+    const envPassword = import.meta.env.VITE_APP_PASSWORD
+    const localProjectId = localStorage.getItem('soleh-firebase-project-id')
+    const localSecretId = localStorage.getItem('soleh-firebase-secret-id')
+    const localPassword = localStorage.getItem('soleh-app-password')
+    return {
+      projectId: localProjectId || envProjectId || '',
+      secretId: localSecretId || envSecretId || '',
+      password: localPassword || envPassword || ''
+    }
+  })
+
+  const [settingsFormData, setSettingsFormData] = useState({
+    projectId: config.projectId,
+    secretId: config.secretId,
+    password: config.password
+  })
+
+  const lastSavedStateRef = useRef('')
+
+  // --- Password Protection States ---
+  const [isAuthenticated, setIsAuthenticated] = useState(() => {
+    const activeSession = sessionStorage.getItem('soleh-authenticated')
+    const envPassword = import.meta.env.VITE_APP_PASSWORD
+    const localPassword = localStorage.getItem('soleh-app-password')
+    const requiredPassword = localPassword || envPassword || ''
+    if (!requiredPassword) return true
+    return activeSession === 'true'
+  })
+
+  const [passwordInput, setPasswordInput] = useState('')
+  const [passwordError, setPasswordError] = useState(false)
+
   // Modal States
   const [isProductModalOpen, setIsProductModalOpen] = useState(false)
   const [isSaleModalOpen, setIsSaleModalOpen] = useState(false)
@@ -58,6 +96,201 @@ function App() {
     quantityProduced: '',
     materialsUsed: {} // { id: amount }
   })
+
+  // --- Helper REST API Functions ---
+  const fetchFromCloud = async (overrideConfig = config) => {
+    const { projectId, secretId } = overrideConfig
+    if (!projectId || !secretId) return null
+    
+    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/inventory/${secretId}`
+    const res = await fetch(url)
+    if (res.status === 404) {
+      return { isNew: true }
+    }
+    if (!res.ok) {
+      throw new Error(`Error de red: ${res.statusText}`)
+    }
+    const doc = await res.json()
+    if (doc.fields && doc.fields.data && doc.fields.data.stringValue) {
+      return JSON.parse(doc.fields.data.stringValue)
+    }
+    return null
+  }
+
+  const saveToCloud = async (stateToSave, overrideConfig = config) => {
+    const { projectId, secretId } = overrideConfig
+    if (!projectId || !secretId) return
+    
+    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/inventory/${secretId}`
+    const res = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        fields: {
+          data: {
+            stringValue: JSON.stringify(stateToSave)
+          }
+        }
+      })
+    })
+    
+    if (!res.ok) {
+      throw new Error(`Error al guardar en la nube: ${res.statusText}`)
+    }
+  }
+
+  // --- Handlers for Database Settings & Migration ---
+  const handleSaveSettings = (e) => {
+    e.preventDefault()
+    const { projectId, secretId, password } = settingsFormData
+    
+    if (projectId) {
+      localStorage.setItem('soleh-firebase-project-id', projectId.trim())
+    } else {
+      localStorage.removeItem('soleh-firebase-project-id')
+    }
+    
+    if (secretId) {
+      localStorage.setItem('soleh-firebase-secret-id', secretId.trim())
+    } else {
+      localStorage.removeItem('soleh-firebase-secret-id')
+    }
+
+    if (password) {
+      localStorage.setItem('soleh-app-password', password.trim())
+    } else {
+      localStorage.removeItem('soleh-app-password')
+    }
+    
+    const newConfig = {
+      projectId: projectId.trim(),
+      secretId: secretId.trim(),
+      password: password ? password.trim() : ''
+    }
+    
+    setConfig(newConfig)
+    setIsSettingsModalOpen(false)
+  }
+
+  const handleMigrateToCloud = async () => {
+    if (!config.projectId || !config.secretId) {
+      alert('Por favor, primero guarda la configuración de la nube (ID de Proyecto e ID Secreto).')
+      return
+    }
+    
+    if (!window.confirm('¿Estás seguro de subir todos tus datos locales actuales a la nube? Esto reemplazará lo que esté en la nube por tus datos locales.')) {
+      return
+    }
+    
+    setSyncStatus('loading')
+    try {
+      const currentState = { products, sales, expenses, injections }
+      await saveToCloud(currentState, config)
+      lastSavedStateRef.current = JSON.stringify(currentState)
+      setSyncStatus('cloud')
+      alert('¡Tus datos locales se han subido y sincronizado con la nube de forma exitosa!')
+    } catch (err) {
+      console.error(err)
+      setSyncStatus('error')
+      alert(`Error al migrar datos: ${err.message}`)
+    }
+  }
+
+  const generateSecretId = () => {
+    const uuid = crypto.randomUUID()
+    setSettingsFormData(prev => ({ ...prev, secretId: `soleh-db-${uuid}` }))
+  }
+
+  const handleLoginSubmit = (e) => {
+    e.preventDefault()
+    const envPassword = import.meta.env.VITE_APP_PASSWORD
+    const localPassword = localStorage.getItem('soleh-app-password')
+    const requiredPassword = localPassword || envPassword || ''
+    
+    if (passwordInput === requiredPassword) {
+      sessionStorage.setItem('soleh-authenticated', 'true')
+      setIsAuthenticated(true)
+      setPasswordError(false)
+    } else {
+      setPasswordError(true)
+    }
+  }
+
+  // --- Cloud Sync Effects ---
+  // Load from Cloud on mount or when configuration changes
+  useEffect(() => {
+    const loadData = async () => {
+      if (!config.projectId || !config.secretId) {
+        setSyncStatus('local')
+        return
+      }
+      
+      setSyncStatus('loading')
+      try {
+        const cloudData = await fetchFromCloud(config)
+        if (cloudData) {
+          if (cloudData.isNew) {
+            setSyncStatus('cloud')
+            lastSavedStateRef.current = JSON.stringify({
+              products,
+              sales,
+              expenses,
+              injections
+            })
+          } else {
+            const newProducts = cloudData.products || []
+            const newSales = cloudData.sales || []
+            const newExpenses = cloudData.expenses || []
+            const newInjections = cloudData.injections || []
+            
+            setProducts(newProducts)
+            setSales(newSales)
+            setExpenses(newExpenses)
+            setInjections(newInjections)
+            
+            lastSavedStateRef.current = JSON.stringify({
+              products: newProducts,
+              sales: newSales,
+              expenses: newExpenses,
+              injections: newInjections
+            })
+            
+            setSyncStatus('cloud')
+          }
+        }
+      } catch (err) {
+        console.error('Error al conectar con la nube:', err)
+        setSyncStatus('error')
+      }
+    }
+    
+    loadData()
+  }, [config])
+
+  // Auto-Save to Cloud with debounce
+  useEffect(() => {
+    if (syncStatus !== 'cloud') return
+    
+    const currentState = { products, sales, expenses, injections }
+    const currentStateStr = JSON.stringify(currentState)
+    
+    if (currentStateStr === lastSavedStateRef.current) return
+    
+    const delayDebounceFn = setTimeout(async () => {
+      try {
+        await saveToCloud(currentState)
+        lastSavedStateRef.current = currentStateStr
+        console.log('Sincronizado con la nube exitosamente.')
+      } catch (err) {
+        console.error('Error al sincronizar con la nube:', err)
+        setSyncStatus('error')
+      }
+    }, 1500)
+    
+    return () => clearTimeout(delayDebounceFn)
+  }, [products, sales, expenses, injections, syncStatus])
 
   // --- Effects ---
   useEffect(() => {
@@ -523,11 +756,106 @@ function App() {
     )
   }
 
+  if (!isAuthenticated) {
+    return (
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        minHeight: '100vh',
+        backgroundColor: '#f3f4f6',
+        fontFamily: 'system-ui, sans-serif'
+      }}>
+        <div style={{
+          backgroundColor: '#ffffff',
+          padding: '2.5rem',
+          borderRadius: '16px',
+          boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1)',
+          width: '100%',
+          maxWidth: '400px',
+          textAlign: 'center',
+          border: '1px solid #e5e7eb'
+        }} className="fade-in">
+          <div style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: '64px',
+            height: '64px',
+            borderRadius: '50%',
+            backgroundColor: '#eff6ff',
+            color: '#3b82f6',
+            marginBottom: '1.5rem'
+          }}>
+            <Package size={32} />
+          </div>
+          
+          <h2 style={{ fontSize: '1.75rem', fontWeight: 'bold', color: '#111827', margin: '0 0 0.5rem 0' }}>Soleh</h2>
+          <p style={{ fontSize: '0.9rem', color: '#6b7280', margin: '0 0 2rem 0' }}>Sistema de Inventario Privado</p>
+          
+          <form onSubmit={handleLoginSubmit}>
+            <div style={{ marginBottom: '1.5rem', textAlign: 'left' }}>
+              <label style={{ display: 'block', fontSize: '0.85rem', fontWeight: '600', color: '#374151', marginBottom: '0.5rem' }}>
+                Contraseña de Acceso
+              </label>
+              <input 
+                type="password" 
+                placeholder="••••••••"
+                required
+                style={{
+                  width: '100%',
+                  padding: '0.75rem 1rem',
+                  borderRadius: '8px',
+                  border: passwordError ? '1px solid #ef4444' : '1px solid #d1d5db',
+                  fontSize: '1rem',
+                  outline: 'none',
+                  boxSizing: 'border-box',
+                  backgroundColor: '#f9fafb',
+                  transition: 'border-color 0.2s'
+                }}
+                value={passwordInput}
+                onChange={(e) => {
+                  setPasswordInput(e.target.value)
+                  if (passwordError) setPasswordError(false)
+                }}
+              />
+              {passwordError && (
+                <p style={{ color: '#ef4444', fontSize: '0.8rem', marginTop: '0.5rem', margin: '0.5rem 0 0 0' }}>
+                  ❌ Contraseña incorrecta. Inténtalo de nuevo.
+                </p>
+              )}
+            </div>
+            
+            <button 
+              type="submit" 
+              style={{
+                width: '100%',
+                padding: '0.75rem',
+                backgroundColor: '#3b82f6',
+                color: '#ffffff',
+                border: 'none',
+                borderRadius: '8px',
+                fontSize: '1rem',
+                fontWeight: '600',
+                cursor: 'pointer',
+                transition: 'background-color 0.2s'
+              }}
+              onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#2563eb'}
+              onMouseOut={(e) => e.currentTarget.style.backgroundColor = '#3b82f6'}
+            >
+              Ingresar al Sistema
+            </button>
+          </form>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="app-container">
       <header className="header">
         <div className="container header-content">
-          <div style={{ display: 'flex', alignItems: 'center', gap: '1.5rem' }}>
+          <div className="flex items-center flex-mobile-wrap" style={{ gap: '1rem' }}>
             <div className="logo">
               <span className="logo-main">Soleh</span>
               <span className="logo-sub">Saludable para ti</span>
@@ -545,6 +873,44 @@ function App() {
             >
               Reiniciar Caja
             </button>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', backgroundColor: '#f4f4f5', padding: '0.4rem 0.8rem', borderRadius: '8px', border: '1px solid #e4e4e7', marginLeft: '0.5rem' }}>
+              <span 
+                style={{ 
+                  width: '8px', 
+                  height: '8px', 
+                  borderRadius: '50%', 
+                  backgroundColor: 
+                    syncStatus === 'cloud' ? '#22c55e' : 
+                    syncStatus === 'loading' ? '#eab308' : 
+                    syncStatus === 'error' ? '#ef4444' : '#71717a',
+                  display: 'inline-block' 
+                }} 
+              />
+              <span style={{ fontSize: '0.8rem', fontWeight: '600', color: '#3f3f46' }}>
+                {syncStatus === 'cloud' ? 'Nube Activa' : 
+                 syncStatus === 'loading' ? 'Conectando...' : 
+                 syncStatus === 'error' ? 'Error Nube' : 'Modo Local'}
+              </span>
+              <button 
+                onClick={() => {
+                  setSettingsFormData({ projectId: config.projectId, secretId: config.secretId })
+                  setIsSettingsModalOpen(true)
+                }}
+                style={{ 
+                  background: 'none', 
+                  border: 'none', 
+                  cursor: 'pointer', 
+                  padding: '0.2rem',
+                  marginLeft: '0.25rem',
+                  display: 'flex',
+                  alignItems: 'center',
+                  color: '#71717a'
+                }}
+                title="Configuración de Base de Datos en la Nube"
+              >
+                <Settings size={15} />
+              </button>
+            </div>
           </div>
           <nav className="nav-tabs">
             <button 
@@ -584,9 +950,9 @@ function App() {
       <main className="main-content container">
         {activeTab === 'dashboard' && (
           <div className="fade-in">
-            <div className="flex justify-between items-center" style={{ marginBottom: '2rem' }}>
+            <div className="flex justify-between items-center flex-mobile-column" style={{ marginBottom: '2rem', gap: '1rem' }}>
                <h2 className="section-title">Vista General</h2>
-               <div className="flex" style={{ gap: '1rem' }}>
+               <div className="flex flex-mobile-wrap" style={{ gap: '0.5rem' }}>
                  <button className="btn btn-secondary" onClick={openInjectionModal} style={{ borderColor: 'var(--success-color)', color: 'var(--success-color)' }}>
                     <DollarSign size={18} />
                     <span>Inyectar Capital</span>
@@ -665,7 +1031,7 @@ function App() {
             </div>
 
             {/* Tablas de Ventas y Gastos */}
-            <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: '2rem', alignItems: 'flex-start' }}>
+            <div className="grid dashboard-grid" style={{ gap: '2rem', alignItems: 'flex-start' }}>
               <div>
                 <div className="flex justify-between items-center" style={{ marginBottom: '1rem' }}>
                   <h3 style={{ color: 'var(--text-primary)', margin: 0 }}>Últimas Ventas</h3>
@@ -1330,6 +1696,107 @@ function App() {
                 </button>
                 <button type="submit" className="btn btn-primary" disabled={!productionFormData.productId || !productionFormData.quantityProduced}>
                   Registrar Producción
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Settings Modal */}
+      {isSettingsModalOpen && (
+        <div className="modal-overlay" onClick={() => setIsSettingsModalOpen(false)}>
+          <div className="modal-content" onClick={e => e.stopPropagation()} style={{ maxWidth: '550px' }}>
+            <div className="modal-header">
+              <h3 className="modal-title">Configuración de Base de Datos en la Nube</h3>
+              <button className="modal-close" onClick={() => setIsSettingsModalOpen(false)}>
+                <X size={20} />
+              </button>
+            </div>
+            
+            <form onSubmit={handleSaveSettings}>
+              <p style={{ fontSize: '0.85rem', color: '#4b5563', marginBottom: '1.5rem', lineHeight: '1.4' }}>
+                Conecta tu sistema de inventario a **Firebase Firestore** para guardar tus datos en la nube y verlos desde cualquier lugar o dispositivo en tiempo real.
+              </p>
+              
+              <div className="form-group">
+                <label className="form-label" style={{ fontWeight: '600' }}>Firebase Project ID *</label>
+                <input 
+                  type="text" 
+                  className="form-input" 
+                  required
+                  placeholder="Ej. mi-inventario-soleh"
+                  value={settingsFormData.projectId}
+                  onChange={(e) => setSettingsFormData(prev => ({ ...prev, projectId: e.target.value }))}
+                />
+                <p style={{ fontSize: '0.75rem', color: '#71717a', marginTop: '0.25rem' }}>
+                  El ID único de tu proyecto en la consola de Firebase.
+                </p>
+              </div>
+
+              <div className="form-group" style={{ marginTop: '1.25rem' }}>
+                <label className="form-label" style={{ fontWeight: '600', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span>ID Secreto de Base de Datos (Document ID) *</span>
+                </label>
+                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                  <input 
+                    type="text" 
+                    className="form-input" 
+                    required
+                    style={{ flex: 1, fontFamily: 'monospace', fontSize: '0.85rem' }}
+                    placeholder="soleh-db-xxxx-xxxx"
+                    value={settingsFormData.secretId}
+                    onChange={(e) => setSettingsFormData(prev => ({ ...prev, secretId: e.target.value }))}
+                  />
+                  <button 
+                    type="button" 
+                    className="btn btn-secondary" 
+                    style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', whiteSpace: 'nowrap' }}
+                    onClick={generateSecretId}
+                  >
+                    Generar Nuevo
+                  </button>
+                </div>
+                <p style={{ fontSize: '0.75rem', color: '#71717a', marginTop: '0.25rem' }}>
+                  Actúa como la contraseña de tu base de datos. ¡Guárdalo en un lugar seguro!
+                </p>
+              </div>
+
+              <div className="form-group" style={{ marginTop: '1.25rem' }}>
+                <label className="form-label" style={{ fontWeight: '600' }}>Contraseña de Acceso al Sistema</label>
+                <input 
+                  type="text" 
+                  className="form-input" 
+                  placeholder="Ej. soleh123"
+                  value={settingsFormData.password || ''}
+                  onChange={(e) => setSettingsFormData(prev => ({ ...prev, password: e.target.value }))}
+                />
+                <p style={{ fontSize: '0.75rem', color: '#71717a', marginTop: '0.25rem' }}>
+                  Define una contraseña para proteger tu página web. Si la dejas vacía, se desactivará la pantalla de inicio de sesión.
+                </p>
+              </div>
+
+              <div style={{ marginTop: '1.5rem', padding: '1rem', backgroundColor: '#f0fdf4', borderRadius: '8px', border: '1px solid #bbf7d0' }}>
+                <h4 style={{ margin: '0 0 0.5rem 0', fontSize: '0.9rem', color: '#166534', fontWeight: 'bold' }}>Migrar Datos Existentes</h4>
+                <p style={{ margin: '0 0 1rem 0', fontSize: '0.8rem', color: '#15803d', lineHeight: '1.4' }}>
+                  Si ya tienes productos, ventas o gastos guardados localmente en este navegador, puedes subirlos a la nube inmediatamente haciendo clic en el botón de abajo.
+                </p>
+                <button 
+                  type="button" 
+                  className="btn btn-primary" 
+                  style={{ backgroundColor: '#16a34a', borderColor: '#16a34a', width: '100%', padding: '0.5rem' }}
+                  onClick={handleMigrateToCloud}
+                >
+                  Subir mis Datos Locales a la Nube 📤
+                </button>
+              </div>
+              
+              <div className="modal-footer" style={{ marginTop: '2rem', borderTop: '1px solid #e4e4e7', paddingTop: '1rem' }}>
+                <button type="button" className="btn btn-secondary" onClick={() => setIsSettingsModalOpen(false)}>
+                  Cancelar
+                </button>
+                <button type="submit" className="btn btn-primary" disabled={!settingsFormData.projectId || !settingsFormData.secretId}>
+                  Guardar Configuración
                 </button>
               </div>
             </form>
